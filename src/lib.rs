@@ -194,8 +194,12 @@ pub fn plan(inputs: &[PathBuf], t: &Transforms, existing: &HashSet<PathBuf>) -> 
     }
 
     let mut entries: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(inputs.len());
+    let mut sources = HashSet::new();
 
     for (idx, old) in inputs.iter().enumerate() {
+        if !sources.insert(old) {
+            bail!("duplicate source path: {}", old.display());
+        }
         let parent = old.parent().map(Path::to_path_buf).unwrap_or_default();
         let file_name = old
             .file_name()
@@ -233,8 +237,12 @@ pub fn plan(inputs: &[PathBuf], t: &Transforms, existing: &HashSet<PathBuf>) -> 
             after_ops
         };
 
-        if new_name.is_empty() {
-            bail!("rename of {} produced an empty file name", old.display());
+        if !is_file_name(&new_name) {
+            bail!(
+                "rename of {} must produce a single file name, without separators, '.' or '..': {:?}",
+                old.display(),
+                new_name
+            );
         }
 
         let new_path = parent.join(&new_name);
@@ -246,6 +254,15 @@ pub fn plan(inputs: &[PathBuf], t: &Transforms, existing: &HashSet<PathBuf>) -> 
         entries,
         collisions,
     })
+}
+
+/// Transformation output is a basename, never a destination path. Reject both
+/// separator spellings so plans cannot become paths on another platform.
+pub fn is_file_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    !name.contains(['/', '\\', '\0', ':'])
+        && matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
 }
 
 /// Detect blocking collisions for the refuse policy:

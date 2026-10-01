@@ -121,7 +121,27 @@ batch-rename --regex 's/^.*\.txt$/note.txt/' --collision suffix --commit *.txt
   batch), the whole operation is refused with exit code `2` and nothing is
   touched. The intended plan is still printed so you can see what went wrong.
 - **Swaps are safe.** A batch that renames `a -> b` and `b -> a` is applied via
-  temporary staging names so no file is lost.
+  exclusively reserved staging directories. Final names are created with hard
+  links, which fail if a destination exists, before the previous names are
+  removed. Existing files, directories and dangling symlinks cannot be replaced.
+- **Names stay in their source directory.** Rules and templates must produce a
+  single file name. Absolute paths, separators, `.` / `..`, NUL and colon are
+  rejected. Colons are disallowed for compatibility with Windows drive paths and
+  alternate data streams.
+- **Each source is processed once.** Directory aliases and relative path
+  spellings are normalized before deduplication and sequence numbering. A missing
+  explicit source aborts the batch. Directory-read errors also abort it.
+- **Commit requires regular files and hard-link support.** Explicit source-file
+  symlinks are refused; recursive walks select regular files. A filesystem that
+  cannot create hard links produces an error without replacing existing targets.
+- **I/O failures trigger rollback.** Published files are returned to staging
+  before original names are restored. If restoration fails, the error lists the
+  retained staging directories and affected paths. Staged files keep their
+  original basenames; inspect those directories before retrying.
+- **A batch is not crash-atomic.** A process interruption or power loss can leave
+  files under staging or final names. Do not move, replace or modify participating
+  files or directories concurrently; identity checks reduce accidental races but
+  do not make directory changes by other processes transactional.
 - **Extensions are respected.** Stem-only operations (prefix, suffix, case of the
   stem) never accidentally eat the extension; `--ext` changes it explicitly.
 
