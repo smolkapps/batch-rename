@@ -6,10 +6,12 @@
 //! the plan, and (when committing) performs the moves.
 
 use anyhow::{bail, Context, Result};
-use batch_rename::{plan, resolve_with_suffix, CollisionPolicy, Op, Plan, Transforms};
+use batch_rename::{
+    is_file_name, plan, resolve_with_suffix, CollisionPolicy, Op, Plan, Transforms,
+};
 use clap::{ArgAction, Parser};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -209,10 +211,20 @@ fn gather_inputs(cli: &Cli) -> Result<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
-    let push = |p: PathBuf, out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>| {
+    let push = |p: PathBuf, out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>| -> Result<()> {
+        let metadata = std::fs::symlink_metadata(&p)
+            .with_context(|| format!("reading source {}", p.display()))?;
+        if !metadata.file_type().is_file() {
+            bail!(
+                "source must be a regular file, not a symlink: {}",
+                p.display()
+            );
+        }
+        let p = normalise_parent(&p)?;
         if seen.insert(p.clone()) {
             out.push(p);
         }
+        Ok(())
     };
 
     for raw in &cli.inputs {
@@ -226,11 +238,11 @@ fn gather_inputs(cli: &Cli) -> Result<Vec<PathBuf>> {
                 matched = true;
                 if p.is_dir() {
                     if cli.recursive {
-                        walk_dir(&p, &mut |f| push(f, &mut out, &mut seen));
+                        walk_dir(&p, &mut |f| push(f, &mut out, &mut seen))?;
                     }
                     // non-recursive: skip directories from globs
                 } else {
-                    push(p, &mut out, &mut seen);
+                    push(p, &mut out, &mut seen)?;
                 }
             }
             if !matched {
@@ -238,14 +250,14 @@ fn gather_inputs(cli: &Cli) -> Result<Vec<PathBuf>> {
             }
         } else if path.is_dir() {
             if cli.recursive {
-                walk_dir(path, &mut |f| push(f, &mut out, &mut seen));
+                walk_dir(path, &mut |f| push(f, &mut out, &mut seen))?;
             } else {
                 eprintln!("warning: '{raw}' is a directory; pass --recursive to descend into it");
             }
         } else if path.exists() {
-            push(path.to_path_buf(), &mut out, &mut seen);
+            push(path.to_path_buf(), &mut out, &mut seen)?;
         } else {
-            eprintln!("warning: no such file: '{raw}'");
+            bail!("no such file: '{raw}'");
         }
     }
 
@@ -253,17 +265,19 @@ fn gather_inputs(cli: &Cli) -> Result<Vec<PathBuf>> {
 }
 
 /// Walk a directory, invoking `f` on every regular file found (files only).
-fn walk_dir(dir: &Path, f: &mut dyn FnMut(PathBuf)) {
-    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+fn walk_dir(dir: &Path, f: &mut dyn FnMut(PathBuf) -> Result<()>) -> Result<()> {
+    for entry in WalkDir::new(dir) {
+        let entry = entry.with_context(|| format!("walking {}", dir.display()))?;
         if entry.file_type().is_file() {
-            f(entry.into_path());
+            f(entry.into_path())?;
         }
     }
+    Ok(())
 }
 
 /// Collect the set of paths that currently exist in the parent directory of any
 /// input. This is what the planner uses to detect "target already exists".
-fn existing_paths(inputs: &[PathBuf]) -> HashSet<PathBuf> {
+fn existing_paths(inputs: &[PathBuf]) -> Result<HashSet<PathBuf>> {
     let mut dirs: HashSet<PathBuf> = HashSet::new();
     for p in inputs {
         dirs.insert(p.parent().map(Path::to_path_buf).unwrap_or_default());
@@ -275,22 +289,22 @@ fn existing_paths(inputs: &[PathBuf]) -> HashSet<PathBuf> {
         } else {
             std::fs::read_dir(&d)
         };
-        if let Ok(rd) = read {
-            for e in rd.flatten() {
-                // Normalise so that a "" parent (cwd) matches the planner's
-                // `parent.join(name)` which yields a bare relative path.
-                let path = e.path();
-                if d.as_os_str().is_empty() {
-                    if let Some(name) = path.file_name() {
-                        set.insert(PathBuf::from(name));
-                    }
-                } else {
-                    set.insert(path);
+        let rd = read.with_context(|| format!("checking existing names in {}", d.display()))?;
+        for e in rd {
+            let e = e.with_context(|| format!("reading existing names in {}", d.display()))?;
+            // Normalise so that a "" parent (cwd) matches the planner's
+            // `parent.join(name)` which yields a bare relative path.
+            let path = e.path();
+            if d.as_os_str().is_empty() {
+                if let Some(name) = path.file_name() {
+                    set.insert(PathBuf::from(name));
                 }
+            } else {
+                set.insert(path);
             }
         }
     }
-    set
+    Ok(set)
 }
 
 /// Pretty-print the plan as an `old -> new` table.
@@ -341,7 +355,7 @@ fn run() -> Result<i32> {
         bail!("no matching files to rename.");
     }
 
-    let existing = existing_paths(&inputs);
+    let existing = existing_paths(&inputs)?;
     let policy: CollisionPolicy = cli.collision.into();
 
     let raw_plan = plan(&inputs, &transforms, &existing)?;
@@ -390,52 +404,299 @@ fn run() -> Result<i32> {
     Ok(0)
 }
 
-/// Apply the renames safely. To avoid clobbering a source that is itself about
-/// to move (A->B, B->C), we move via temporary names when a target is also a
-/// pending source. Simpler and robust: rename to unique temp names first, then
-/// to final names.
+/// Resolve directory aliases without following a source-file symlink or losing
+/// the file name that the user selected.
+fn normalise_parent(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("path has no file name: {}", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolving parent directory of {}", path.display()))?;
+    Ok(parent.join(name))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Location {
+    Original,
+    Staged,
+    Final,
+}
+
+struct Rename {
+    old: PathBuf,
+    new: PathBuf,
+    staged: PathBuf,
+    metadata: std::fs::Metadata,
+    location: Location,
+}
+
+/// Stage every source in a reserved directory, then publish using hard links:
+/// creating a link fails atomically if a destination already exists. Unlinking
+/// the previous name preserves file contents/identity. On ordinary I/O failure,
+/// return completed moves to staging before restoring their original names.
 fn apply_renames(plan: &Plan) -> Result<usize> {
-    let changes: Vec<&(PathBuf, PathBuf)> = plan.changes().collect();
-    if changes.is_empty() {
+    if plan.has_collisions() {
+        bail!("refusing to apply a plan with collisions");
+    }
+    let mut sources = HashSet::new();
+    let mut targets = HashSet::new();
+    let mut renames = Vec::new();
+    for (old, new) in &plan.entries {
+        let old = normalise_parent(old)?;
+        let new = normalise_parent(new)?;
+        let name = new.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if old.parent() != new.parent() || !is_file_name(name) {
+            bail!(
+                "destination must be a single file name in the source directory: {}",
+                new.display()
+            );
+        }
+        if !sources.insert(old.clone()) {
+            bail!("duplicate source path: {}", old.display());
+        }
+        if !targets.insert(new.clone()) {
+            bail!("duplicate destination path: {}", new.display());
+        }
+        let metadata = std::fs::symlink_metadata(&old)
+            .with_context(|| format!("reading source {}", old.display()))?;
+        if !metadata.file_type().is_file() {
+            bail!(
+                "source must be a regular file, not a symlink: {}",
+                old.display()
+            );
+        }
+        if old != new {
+            renames.push(Rename {
+                old,
+                new,
+                staged: PathBuf::new(),
+                metadata,
+                location: Location::Original,
+            });
+        }
+    }
+    if renames.is_empty() {
         return Ok(0);
     }
 
-    let targets: HashSet<&PathBuf> = changes.iter().map(|(_, n)| n).collect();
-    let needs_temp = changes.iter().any(|(o, _)| targets.contains(o));
-
-    if !needs_temp {
-        // No source is also a target — direct moves are safe.
-        for (old, new) in &changes {
-            ensure_parent(new)?;
-            std::fs::rename(old, new)
-                .with_context(|| format!("renaming {} -> {}", old.display(), new.display()))?;
+    // Reserve all directories before moving any source. A directory is owned
+    // only after exclusive creation succeeds; unrelated candidates are ignored.
+    let mut directories: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for rename in &mut renames {
+        let parent = rename.old.parent().unwrap().to_path_buf();
+        if !directories.contains_key(&parent) {
+            match reserve_staging(&parent) {
+                Ok(directory) => {
+                    directories.insert(parent.clone(), directory);
+                }
+                Err(error) => {
+                    cleanup_staging(&directories)
+                        .context("sources unchanged; staging cleanup failed")?;
+                    return Err(error);
+                }
+            }
         }
-        return Ok(changes.len());
+        rename.staged = directories[&parent].join(rename.old.file_name().unwrap());
     }
 
-    // Two-phase: old -> temp -> new.
-    let mut temps: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(changes.len());
-    for (i, (old, _new)) in changes.iter().enumerate() {
-        let parent = old.parent().map(Path::to_path_buf).unwrap_or_default();
-        let tmp = parent.join(format!(".batch-rename.tmp.{}.{}", std::process::id(), i));
-        std::fs::rename(old, &tmp)
-            .with_context(|| format!("staging {} -> {}", old.display(), tmp.display()))?;
-        temps.push((tmp, changes[i].1.clone()));
+    for index in 0..renames.len() {
+        let rename = &renames[index];
+        if let Err(error) = move_without_clobber(&rename.old, &rename.staged, &rename.metadata) {
+            return Err(recover_batch(error, &mut renames, &directories));
+        }
+        renames[index].location = Location::Staged;
     }
-    for (tmp, new) in &temps {
-        ensure_parent(new)?;
-        std::fs::rename(tmp, new)
-            .with_context(|| format!("finalising {} -> {}", tmp.display(), new.display()))?;
+    for index in 0..renames.len() {
+        let rename = &renames[index];
+        if let Err(error) = move_without_clobber(&rename.staged, &rename.new, &rename.metadata) {
+            return Err(recover_batch(error, &mut renames, &directories));
+        }
+        renames[index].location = Location::Final;
     }
-    Ok(changes.len())
+    cleanup_staging(&directories).context("renames completed, but staging cleanup failed")?;
+    Ok(renames.len())
 }
 
-fn ensure_parent(p: &Path) -> Result<()> {
-    if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating directory {}", parent.display()))?;
+fn reserve_staging(parent: &Path) -> Result<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    for attempt in 0..1000 {
+        let directory = parent.join(format!(
+            ".batch-rename.stage.{}.{stamp}.{attempt}",
+            std::process::id()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
+        match builder.create(&directory) {
+            Ok(()) => return Ok(directory),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("reserving staging directory in {}", parent.display())
+                })
+            }
+        }
+    }
+    bail!(
+        "could not reserve a staging directory in {}",
+        parent.display()
+    )
+}
+
+fn check_identity(path: &Path, expected: &std::fs::Metadata) -> Result<()> {
+    let actual = std::fs::symlink_metadata(path)
+        .with_context(|| format!("checking file identity at {}", path.display()))?;
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        actual.dev() == expected.dev() && actual.ino() == expected.ino()
+    };
+    #[cfg(not(unix))]
+    let same = actual.len() == expected.len()
+        && actual.modified().ok() == expected.modified().ok()
+        && actual.created().ok() == expected.created().ok();
+    if !actual.file_type().is_file() || !same {
+        bail!(
+            "file changed during rename; refusing to remove {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn move_without_clobber(old: &Path, new: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    check_identity(old, metadata)?;
+    std::fs::hard_link(old, new).with_context(|| {
+        format!(
+            "creating {} without overwriting (from {})",
+            new.display(),
+            old.display()
+        )
+    })?;
+    let remove_source = check_identity(new, metadata)
+        .and_then(|_| check_identity(old, metadata))
+        .and_then(|_| {
+            std::fs::remove_file(old)
+                .with_context(|| format!("removing previous name {}", old.display()))
+        });
+    if let Err(error) = remove_source {
+        // Remove the new link only while the previous name still holds this
+        // file. Otherwise retain the surviving copy for batch recovery.
+        check_identity(old, metadata).with_context(|| {
+            format!("{error:#}; destination link retained at {}", new.display())
+        })?;
+        check_identity(new, metadata)
+            .and_then(|_| std::fs::remove_file(new).context("removing unused destination link"))
+            .with_context(|| {
+                format!(
+                    "{error:#}; source retained, but destination cleanup failed at {}",
+                    new.display()
+                )
+            })?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn recover_batch(
+    error: anyhow::Error,
+    renames: &mut [Rename],
+    directories: &HashMap<PathBuf, PathBuf>,
+) -> anyhow::Error {
+    let mut failures = Vec::new();
+    // An unlink error can leave only the newly created link. Discover that
+    // copy before recovery instead of trusting the last completed step.
+    for rename in renames.iter_mut() {
+        if rename.location == Location::Original
+            && check_identity(&rename.old, &rename.metadata).is_err()
+            && check_identity(&rename.staged, &rename.metadata).is_ok()
+        {
+            rename.location = Location::Staged;
+        }
+        if rename.location == Location::Staged
+            && check_identity(&rename.staged, &rename.metadata).is_err()
+            && check_identity(&rename.new, &rename.metadata).is_ok()
+        {
+            rename.location = Location::Final;
+        }
+    }
+    // Vacate every successfully published target first, including cycles.
+    for rename in renames
+        .iter_mut()
+        .rev()
+        .filter(|r| r.location == Location::Final)
+    {
+        match move_without_clobber(&rename.new, &rename.staged, &rename.metadata) {
+            Ok(()) => rename.location = Location::Staged,
+            Err(failure) => failures.push(format!(
+                "{} -> {}: {failure:#}",
+                rename.new.display(),
+                rename.old.display()
+            )),
+        }
+    }
+    for rename in renames
+        .iter_mut()
+        .filter(|r| r.location == Location::Staged)
+    {
+        match move_without_clobber(&rename.staged, &rename.old, &rename.metadata) {
+            Ok(()) => rename.location = Location::Original,
+            Err(failure) => failures.push(format!(
+                "{} -> {}: {failure:#}",
+                rename.staged.display(),
+                rename.old.display()
+            )),
+        }
+    }
+    for rename in renames.iter().filter(|r| r.location == Location::Original) {
+        if let Err(failure) = check_identity(&rename.old, &rename.metadata) {
+            failures.push(format!(
+                "original contents not restored at {}: {failure:#}",
+                rename.old.display()
+            ));
+        }
+    }
+    if failures.is_empty() {
+        match cleanup_staging(directories) {
+            Ok(()) => error.context("rename failed; all original names restored"),
+            Err(cleanup) => error.context(format!(
+                "all original names restored; staging cleanup failed: {cleanup:#}"
+            )),
+        }
+    } else {
+        let retained = directories
+            .values()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        error.context(format!(
+            "rollback incomplete; retained staging directories: {retained}; recovery errors: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+fn cleanup_staging(directories: &HashMap<PathBuf, PathBuf>) -> Result<()> {
+    let mut failures = Vec::new();
+    for directory in directories.values() {
+        if let Err(error) = std::fs::remove_dir(directory) {
+            failures.push(format!("{}: {error}", directory.display()));
+        }
+    }
+    if !failures.is_empty() {
+        bail!(
+            "could not remove staging directories: {}",
+            failures.join("; ")
+        );
     }
     Ok(())
 }
@@ -447,5 +708,154 @@ fn main() {
             eprintln!("error: {e:#}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn fixture_plan(dir: &Path, names: &[(&str, &str)]) -> Plan {
+        Plan {
+            entries: names
+                .iter()
+                .map(|(old, new)| (dir.join(old), dir.join(new)))
+                .collect(),
+            collisions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn applying_a_plan_checks_existing_destinations_again() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a"), b"SOURCE").unwrap();
+        fs::write(dir.path().join("keep"), b"KEEP").unwrap();
+        let plan = fixture_plan(dir.path(), &[("a", "keep")]);
+
+        assert!(apply_renames(&plan).is_err());
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"SOURCE");
+        assert_eq!(fs::read(dir.path().join("keep")).unwrap(), b"KEEP");
+    }
+
+    #[test]
+    fn swaps_preserve_preexisting_staging_candidates_across_repeated_runs() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a"), b"AAA").unwrap();
+        fs::write(dir.path().join("b"), b"BBB").unwrap();
+        let candidate = dir
+            .path()
+            .join(format!(".batch-rename.tmp.{}.0", std::process::id()));
+        fs::write(&candidate, b"KEEP").unwrap();
+        let plan = fixture_plan(dir.path(), &[("a", "b"), ("b", "a")]);
+
+        assert_eq!(apply_renames(&plan).unwrap(), 2);
+        assert_eq!(fs::read(&candidate).unwrap(), b"KEEP");
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"BBB");
+        assert_eq!(fs::read(dir.path().join("b")).unwrap(), b"AAA");
+        assert_eq!(apply_renames(&plan).unwrap(), 2);
+        assert_eq!(fs::read(&candidate).unwrap(), b"KEEP");
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"AAA");
+        assert_eq!(fs::read(dir.path().join("b")).unwrap(), b"BBB");
+    }
+
+    #[test]
+    fn failed_direct_batch_keeps_all_original_sources() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a"), b"AAA").unwrap();
+        let plan = fixture_plan(dir.path(), &[("a", "new"), ("missing", "other")]);
+
+        assert!(apply_renames(&plan).is_err());
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"AAA");
+        assert!(!dir.path().join("new").exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_staged_batch_keeps_all_original_sources() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a"), b"AAA").unwrap();
+        fs::write(dir.path().join("b"), b"BBB").unwrap();
+        let plan = fixture_plan(dir.path(), &[("a", "b"), ("b", "a"), ("missing", "other")]);
+
+        assert!(apply_renames(&plan).is_err());
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"AAA");
+        assert_eq!(fs::read(dir.path().join("b")).unwrap(), b"BBB");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn finalisation_failure_restores_the_staged_batch() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a"), b"AAA").unwrap();
+        fs::write(dir.path().join("b"), b"BBB").unwrap();
+        let too_long = "x".repeat(300);
+        let plan = fixture_plan(dir.path(), &[("a", "b"), ("b", &too_long)]);
+
+        let error = apply_renames(&plan).unwrap_err();
+        assert!(format!("{error:#}").contains("all original names restored"));
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"AAA");
+        assert_eq!(fs::read(dir.path().join("b")).unwrap(), b"BBB");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failed_rollback_preserves_staged_contents_and_the_new_occupant() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("a");
+        fs::write(&old, b"SOURCE").unwrap();
+        let metadata = fs::symlink_metadata(&old).unwrap();
+        let staging = reserve_staging(dir.path()).unwrap();
+        let staged = staging.join("a");
+        move_without_clobber(&old, &staged, &metadata).unwrap();
+        fs::write(&old, b"KEEP").unwrap();
+        let mut renames = vec![Rename {
+            old: old.clone(),
+            new: dir.path().join("new"),
+            staged: staged.clone(),
+            metadata,
+            location: Location::Staged,
+        }];
+        let directories = HashMap::from([(dir.path().to_path_buf(), staging.clone())]);
+
+        let error = recover_batch(
+            anyhow::anyhow!("fixture I/O failure"),
+            &mut renames,
+            &directories,
+        );
+        assert!(format!("{error:#}").contains("rollback incomplete"));
+        assert!(format!("{error:#}").contains(staging.to_str().unwrap()));
+        assert_eq!(fs::read(old).unwrap(), b"KEEP");
+        assert_eq!(fs::read(staged).unwrap(), b"SOURCE");
+    }
+
+    #[test]
+    fn recovery_finds_a_retained_link_when_the_previous_name_disappeared() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("a");
+        fs::write(&old, b"SOURCE").unwrap();
+        let metadata = fs::symlink_metadata(&old).unwrap();
+        let staging = reserve_staging(dir.path()).unwrap();
+        let staged = staging.join("a");
+        fs::hard_link(&old, &staged).unwrap();
+        fs::remove_file(&old).unwrap();
+        let mut renames = vec![Rename {
+            old: old.clone(),
+            new: dir.path().join("new"),
+            staged,
+            metadata,
+            location: Location::Original,
+        }];
+        let directories = HashMap::from([(dir.path().to_path_buf(), staging.clone())]);
+
+        let error = recover_batch(
+            anyhow::anyhow!("fixture unlink failure"),
+            &mut renames,
+            &directories,
+        );
+        assert!(format!("{error:#}").contains("all original names restored"));
+        assert_eq!(fs::read(old).unwrap(), b"SOURCE");
+        assert!(!staging.exists());
     }
 }
