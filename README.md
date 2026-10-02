@@ -116,6 +116,10 @@ batch-rename --regex 's/^.*\.txt$/note.txt/' --collision suffix --commit *.txt
 
 ## Safety details
 
+Back up important files and inspect the dry-run plan before using `--commit`.
+See [RELEASE-USAGE.txt](RELEASE-USAGE.txt) for installation and a preview-first
+workflow using disposable fixture examples.
+
 - **Collision = refuse.** If two sources would land on the same target, or a
   target already exists on disk (and isn't itself being renamed away in the same
   batch), the whole operation is refused with exit code `2` and nothing is

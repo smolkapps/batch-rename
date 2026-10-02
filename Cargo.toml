@@ -1,6 +1,6 @@
 [package]
 name = "batch-rename"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A safe regex/template batch file renamer (dry-run by default)"
 license = "MIT"
