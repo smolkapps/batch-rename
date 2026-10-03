@@ -24,10 +24,46 @@ folding, extension changes, and sequential numbering with templates.
 
 ## Install
 
+Download `batch-rename-linux-x86_64` and `SHA256SUMS` from the
+[v0.1.1 release](https://github.com/smolkapps/batch-rename/releases/tag/v0.1.1)
+into a new directory, then:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS &&
+install -Dm755 batch-rename-linux-x86_64 ./batch-rename-bin/batch-rename &&
+./batch-rename-bin/batch-rename --version
+```
+
+The supplied binary is GNU/Linux x86_64, tested with glibc 2.39, and uses GLIBC
+symbols through 2.34. Other platforms have not been verified; see the release's
+`BUILD-INFO.txt` for library requirements.
+
+Or build from source:
+
 ```sh
 cargo build --release
 # binary at target/release/batch-rename
 ```
+
+## Try a preview
+
+After installing the downloaded binary above, create two disposable files and
+preview a shared prefix:
+
+```sh
+(
+  set -e
+  fixture=$(mktemp -d)
+  printf 'generated A\n' > "$fixture/a.txt"
+  printf 'generated B\n' > "$fixture/b.txt"
+  ./batch-rename-bin/batch-rename --recursive --prefix reviewed_ "$fixture"
+  printf 'Fixture retained at %s\n' "$fixture"
+)
+```
+
+The plan proposes `a.txt -> reviewed_a.txt` and `b.txt -> reviewed_b.txt`.
+Nothing is renamed; the fixture is retained for inspection. Back up real files
+and read the [safety details](#safety-details) before applying a rename.
 
 ## Usage
 
